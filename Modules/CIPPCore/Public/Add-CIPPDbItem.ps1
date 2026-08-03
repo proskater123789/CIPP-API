@@ -21,18 +21,29 @@ function Add-CIPPDbItem {
 
         [switch]$Count,
         [switch]$AddCount,
-        [switch]$Append
+        [switch]$Append,
+
+        [ValidateRange(0, 60)]
+        [int]$SkewMarginMinutes = 5
     )
 
     begin {
         $Table = Get-CippTable -tablename 'CippReportingDB'
-        $Batch = [System.Collections.Generic.List[hashtable]]::new()
-        $NewRowKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $BatchSize = 100
+        $Batch = [System.Collections.Generic.List[hashtable]]::new($BatchSize)
+        $SeenInBatch = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $RunStartUtc = [DateTimeOffset]::UtcNow.AddMinutes(-$SkewMarginMinutes)
+
         $TotalProcessed = 0
+        # Cache regex instances so each row pays only the match cost, not regex compilation.
+        # Two passes preserve the original semantics: path/wildcard chars → '_', control chars → stripped.
+        $RowKeyPathRegex = [regex]::new('[/\\#?]')
+        $RowKeyControlRegex = [regex]::new('[\u0000-\u001F\u007F-\u009F]')
 
         if ($TenantFilter -match '^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$') {
             try {
-                $TenantFilter = (Get-Tenants -TenantFilter $TenantFilter -IncludeErrors | Select-Object -First 1).defaultDomainName
+                $TenantLookup = @(Get-Tenants -TenantFilter $TenantFilter -IncludeErrors)
+                if ($TenantLookup.Count -gt 0) { $TenantFilter = $TenantLookup[0].defaultDomainName }
             } catch {}
         }
     }
@@ -48,18 +59,19 @@ function Add-CIPPDbItem {
         foreach ($Item in @($InputObject)) {
             if ($null -eq $Item) { continue }
             $ItemId = $Item.ExternalDirectoryObjectId ?? $Item.id ?? $Item.Identity ?? $Item.skuId ?? $Item.userPrincipalName ?? [guid]::NewGuid().ToString()
-            $RowKey = "$Type-$ItemId" -replace '[/\\#?]', '_' -replace '[\u0000-\u001F\u007F-\u009F]', ''
-            if ($NewRowKeys.Add($RowKey)) {
+            $RowKey = $RowKeyControlRegex.Replace($RowKeyPathRegex.Replace("$Type-$ItemId", '_'), '')
+            if ($SeenInBatch.Add($RowKey)) {
                 $Batch.Add(@{
                         PartitionKey = $TenantFilter
                         RowKey       = $RowKey
                         Data         = [string]($Item | ConvertTo-Json -Depth 10 -Compress)
                         Type         = $Type
                     })
-                if ($Batch.Count -ge 500) {
+                if ($Batch.Count -ge $BatchSize) {
                     $null = Add-CIPPAzDataTableEntity @Table -Entity $Batch.ToArray() -Force
                     $TotalProcessed += $Batch.Count
                     $Batch.Clear()
+                    $SeenInBatch.Clear()
                 }
             }
         }
@@ -71,20 +83,25 @@ function Add-CIPPDbItem {
             $TotalProcessed += $Batch.Count
         }
 
-        # Clean up orphaned rows (entities that no longer exist in the new dataset)
+        # Clean up orphaned rows (entities that no longer exist in the new dataset).
         if (-not $Count.IsPresent -and -not $Append.IsPresent -and $TotalProcessed -gt 0) {
             $Filter = "PartitionKey eq '{0}' and RowKey ge '{1}-' and RowKey lt '{1}0'" -f $TenantFilter, $Type
-            $Existing = Get-CIPPAzDataTableEntity @Table -Filter $Filter -Property PartitionKey, RowKey, ETag, OriginalEntityId
+            $Existing = Get-CIPPAzDataTableEntity @Table -Filter $Filter -Property PartitionKey, RowKey, ETag, OriginalEntityId, Timestamp
             if ($Existing) {
+                $Undated = 0
                 $Orphans = foreach ($Row in @($Existing)) {
                     if ($Row.RowKey -eq "$Type-Count") { continue }
-                    $ParentKey = $Row.OriginalEntityId ?? $Row.RowKey
-                    if (-not $NewRowKeys.Contains($ParentKey)) {
-                        $Row
-                    }
+
+                    $Stamp = $Row.Timestamp -as [datetimeoffset]
+                    if ($null -eq $Stamp) { $Undated++; continue }
+
+                    if ($Stamp -lt $RunStartUtc) { $Row }
+                }
+                if ($Undated -gt 0) {
+                    Write-LogMessage -API 'CIPPDbItem' -tenant $TenantFilter -sev Warning -message "Skipped $Undated $Type row(s) with no readable Timestamp during orphan cleanup — not deleting without positive evidence"
                 }
                 if ($Orphans) {
-                    $null = Remove-AzDataTableEntity @Table -Entity @($Orphans) -Force
+                    $null = Remove-CIPPAzDataTableEntity @Table -Entity @($Orphans) -Force
                 }
             }
         }
@@ -101,6 +118,7 @@ function Add-CIPPDbItem {
                 PartitionKey = $TenantFilter
                 RowKey       = "$Type-Count"
                 DataCount    = [int]$NewCount
+                Type         = $Type
             } -Force
             $CountMs = $Stopwatch.ElapsedMilliseconds - $CntStart
         }

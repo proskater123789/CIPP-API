@@ -12,12 +12,12 @@ function Invoke-ExecEditTemplate {
     try {
         $Table = Get-CippTable -tablename 'templates'
         $guid = $request.Body.id ? $request.Body.id : $request.Body.GUID
-        $JSON = ConvertTo-Json -Compress -Depth 100 -InputObject ($request.Body | Select-Object * -ExcludeProperty GUID)
+        $JSON = ConvertTo-Json -Compress -Depth 100 -InputObject ($request.Body | Select-Object * -ExcludeProperty GUID, source, isSynced, package)
         $Type = $request.Query.Type ?? $Request.Body.Type
 
         if ($Type -eq 'IntuneTemplate') {
             Write-Host 'Intune Template'
-            $SafeGUID = ConvertTo-CIPPODataFilterValue -Value $GUID -Type Guid
+            $SafeGUID = ConvertTo-CIPPODataFilterValue -Value $GUID -Type String
             $Template = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'IntuneTemplate' and RowKey eq '$SafeGUID'"
             $OriginalJSON = $Template.JSON
 
@@ -63,13 +63,14 @@ function Invoke-ExecEditTemplate {
             }
             Set-CIPPIntuneTemplate @IntuneTemplate
         } else {
-            $Table.Force = $true
-            Add-CIPPAzDataTableEntity @Table -Entity @{
+            $Entity = @{
                 JSON         = "$JSON"
                 RowKey       = "$GUID"
                 PartitionKey = "$Type"
                 GUID         = "$GUID"
+                SHA          = ''
             }
+            Add-CIPPAzDataTableEntity @Table -Entity $Entity -OperationType 'UpsertMerge'
             Write-LogMessage -headers $Request.Headers -API $APINAME -message "Edited template $($Request.Body.name) with GUID $GUID" -Sev 'Debug'
         }
         $body = [pscustomobject]@{ 'Results' = 'Successfully saved the template' }

@@ -124,6 +124,46 @@ function Invoke-EditGroup {
         }
     }
 
+    $AddDevices = $UserObj.AddDevice
+    if ($AddDevices) {
+        $AddDevices | ForEach-Object {
+            $Device = $_
+            try {
+                $DeviceLabel = $Device.label ?? $Device.addedFields.deviceName ?? $Device.value
+                if ($GroupType -eq 'Distribution List' -or $GroupType -eq 'Mail-Enabled Security') {
+                    $Results.Add("Error - Devices cannot be added to a $GroupType group")
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $TenantId -message "Cannot add device $DeviceLabel to $($GroupName): devices are not supported in a $GroupType group" -Sev 'Error'
+                } else {
+                    # Intune device rows carry the Entra deviceId (azureADDeviceId) rather than the
+                    # directory object id - resolve it via the devices alternate key
+                    $DeviceID = $Device.value
+                    if ($Device.addedFields.azureADDeviceId) {
+                        $DeviceID = (New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/devices(deviceId='$($Device.addedFields.azureADDeviceId)')?`$select=id" -tenantid $TenantId).id
+                    }
+
+                    $AddDeviceBody = @{
+                        'members@odata.bind' = @($MemberODataBindString -f $DeviceID)
+                    }
+                    $BulkRequests.Add(@{
+                            id      = "addDevice-$DeviceID"
+                            method  = 'PATCH'
+                            url     = "groups/$($GroupId)"
+                            body    = $AddDeviceBody
+                            headers = @{
+                                'Content-Type' = 'application/json'
+                            }
+                        })
+                    $GraphLogs.Add(@{
+                            message = "Added device $DeviceLabel to $($GroupName) group"
+                            id      = "addDevice-$DeviceID"
+                        })
+                }
+            } catch {
+                Write-Warning "Error in AddDevices: $($_.Exception.Message)"
+                $Results.Add("Error - Failed to add device $DeviceLabel to $($GroupName): $($_.Exception.Message)")
+            }
+        }
+    }
 
     $AddContacts = $UserObj.AddContact
     if ($AddContacts) {
@@ -351,6 +391,21 @@ function Invoke-EditGroup {
                 $Sev = 'Info'
                 $Results.Add("Success - $Message")
                 Write-LogMessage -headers $Headers -API $APIName -tenant $TenantId -message $Message -Sev $Sev
+            }
+        }
+    }
+
+    # Only process licenses for Security groups
+    if ($GroupType -eq 'Security') {
+        $AddLicenses = @($UserObj.AddLicenses | Where-Object { $_ } | ForEach-Object { $_.value ?? $_ })
+        $RemoveLicenses = @($UserObj.RemoveLicenses | Where-Object { $_ } | ForEach-Object { $_.value ?? $_ })
+
+        if ($AddLicenses.Count -gt 0 -or $RemoveLicenses.Count -gt 0) {
+            try {
+                $LicResults = Set-CIPPGroupLicense -GroupId $GroupId -GroupName $GroupName -AddLicenses $AddLicenses -RemoveLicenses $RemoveLicenses -TenantFilter $TenantId -Headers $Headers -APIName $APIName
+                foreach ($LicResult in $LicResults) { $Results.Add("Success - $LicResult") }
+            } catch {
+                $Results.Add("Error - $($_.Exception.Message)")
             }
         }
     }

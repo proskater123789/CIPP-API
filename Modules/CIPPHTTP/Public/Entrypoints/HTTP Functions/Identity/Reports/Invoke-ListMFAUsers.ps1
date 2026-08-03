@@ -4,6 +4,8 @@ function Invoke-ListMFAUsers {
         Entrypoint
     .ROLE
         Identity.User.Read
+    .DESCRIPTION
+        Lists users and their MFA registration status for a tenant. Supports UseReportDB=true query parameter to retrieve cached data from the reporting database for significantly better performance, especially when querying AllTenants.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -61,6 +63,7 @@ function Invoke-ListMFAUsers {
             } else {
                 Write-Information 'Getting cached MFA state for all tenants'
                 Write-Information "Found $($Rows.Count) rows in cache"
+                $Rows = $Rows | Select-CippAllowedTenantData -TenantProperty 'Tenant'
                 $Rows = foreach ($Row in $Rows) {
                     if ($Row.CAPolicies -and $Row.CAPolicies -is [string]) {
                         $Row.CAPolicies = try { $Row.CAPolicies | ConvertFrom-Json -ErrorAction Stop } catch { @() }

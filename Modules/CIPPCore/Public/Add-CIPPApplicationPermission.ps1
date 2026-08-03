@@ -31,11 +31,9 @@ function Add-CIPPApplicationPermission {
     } else {
         if (!$RequiredResourceAccess -and $TemplateId) {
             Write-Information "Adding application permissions for template $TemplateId"
-            $TemplateTable = Get-CIPPTable -TableName 'templates'
-            $Filter = "RowKey eq '$TemplateId' and PartitionKey eq 'AppApprovalTemplate'"
-            $Template = (Get-CIPPAzDataTableEntity @TemplateTable -Filter $Filter).JSON | ConvertFrom-Json -ErrorAction SilentlyContinue
-            $ApplicationId = $Template.AppId
-            $Permissions = $Template.Permissions
+            $TemplatePermissions = Get-CIPPAppApprovalPermissions -TemplateId $TemplateId
+            $ApplicationId = $TemplatePermissions.ApplicationId
+            $Permissions = $TemplatePermissions.Permissions
             $RequiredResourceAccess = [System.Collections.Generic.List[object]]::new()
             foreach ($AppId in $Permissions.PSObject.Properties.Name) {
                 $AppPermissions = @($Permissions.$AppId.applicationPermissions)
@@ -58,13 +56,8 @@ function Add-CIPPApplicationPermission {
     Write-Information "Adding application permissions to application $ApplicationId in tenant $TenantFilter"
 
     $ServicePrincipalList = [System.Collections.Generic.List[object]]::new()
-    $CachedSPs = New-CIPPDbRequest -TenantFilter $TenantFilter -Type 'ServicePrincipals'
-    if ($CachedSPs) {
-        foreach ($SP in $CachedSPs) { $ServicePrincipalList.Add($SP) }
-    } else {
-        $SPList = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/servicePrincipals?`$select=AppId,id,displayName&`$top=999" -skipTokenCache $true -tenantid $TenantFilter -NoAuthCheck $true
-        foreach ($SP in $SPList) { $ServicePrincipalList.Add($SP) }
-    }
+    $SPList = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/servicePrincipals?`$select=AppId,id,displayName&`$top=999" -skipTokenCache $true -tenantid $TenantFilter -NoAuthCheck $true
+    foreach ($SP in $SPList) { $ServicePrincipalList.Add($SP) }
     $ourSVCPrincipal = $ServicePrincipalList | Where-Object -Property AppId -EQ $ApplicationId
     if (!$ourSVCPrincipal) {
         #Our Service Principal isn't available yet. We do a sleep and reexecute after 3 seconds.
@@ -127,7 +120,7 @@ function Add-CIPPApplicationPermission {
         if (!$svcPrincipalId) { continue }
 
         foreach ($SingleResource in $App.ResourceAccess | Where-Object -Property Type -EQ 'Role') {
-            if ($SingleResource.id -in $CurrentRoles.appRoleId) { continue }
+            if ($CurrentRoles | Where-Object { $_.appRoleId -eq $SingleResource.id -and $_.resourceId -eq $svcPrincipalId.id }) { continue }
             [pscustomobject]@{
                 principalId = $($ourSVCPrincipal.id)
                 resourceId  = $($svcPrincipalId.id)
@@ -167,6 +160,11 @@ function Add-CIPPApplicationPermission {
         } catch {
             $Results.add("Failed to grant permissions in bulk: $(Get-NormalizedError -message $_.Exception.Message)")
         }
+    }
+    if ($counter -gt 0) {
+        # App-only scopes changed; a cached client_credentials token still carries the old
+        # roles, so drop it rather than wait out its TTL.
+        $null = Clear-CippTokenCache -TenantFilter $TenantFilter
     }
     "Added $counter Application permissions to $($ourSVCPrincipal.displayName)"
     return $Results

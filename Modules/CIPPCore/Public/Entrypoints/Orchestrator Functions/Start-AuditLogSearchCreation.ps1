@@ -15,7 +15,9 @@ function Start-AuditLogSearchCreation {
             if (!$ConfigEntry.excludedTenants) {
                 $ConfigEntry | Add-Member -MemberType NoteProperty -Name 'excludedTenants' -Value @() -Force
             } else {
-                $ConfigEntry.excludedTenants = $ConfigEntry.excludedTenants | ConvertFrom-Json
+                # Expand tenant groups in exclusions so group members match on defaultDomainName
+                $Excluded = $ConfigEntry.excludedTenants | ConvertFrom-Json -ErrorAction SilentlyContinue
+                $ConfigEntry.excludedTenants = if ($Excluded) { @(Expand-CIPPTenantGroups -TenantFilter $Excluded) } else { @() }
             }
             $ConfigEntry.Tenants = $ConfigEntry.Tenants | ConvertFrom-Json
             $ConfigEntry
@@ -44,7 +46,7 @@ function Start-AuditLogSearchCreation {
         }
 
         if ($ExpiredDisabledRows.Count -gt 0) {
-            Remove-AzDataTableEntity @AuditDisabledTable -Entity $ExpiredDisabledRows -Force | Out-Null
+            Remove-CIPPAzDataTableEntity @AuditDisabledTable -Entity $ExpiredDisabledRows -Force | Out-Null
         }
 
         # Round time down to nearest minute
@@ -68,14 +70,13 @@ function Start-AuditLogSearchCreation {
             }
 
             $TenantInConfig = $false
-            $MatchingConfigs = [System.Collections.Generic.List[object]]::new()
             foreach ($ConfigEntry in $ConfigEntries) {
                 if ($ConfigEntry.excludedTenants.value -contains $Tenant.defaultDomainName) {
                     continue
                 }
                 if ($ConfigEntry.ExpandedTenants -contains $Tenant.defaultDomainName -or $ConfigEntry.ExpandedTenants -contains 'AllTenants') {
                     $TenantInConfig = $true
-                    $MatchingConfigs.Add($ConfigEntry)
+                    break
                 }
             }
 
@@ -83,14 +84,11 @@ function Start-AuditLogSearchCreation {
                 continue
             }
 
-            if ($MatchingConfigs) {
-                [PSCustomObject]@{
-                    FunctionName   = 'AuditLogSearchCreation'
-                    Tenant         = $Tenant | Select-Object defaultDomainName, customerId, displayName
-                    StartTime      = $StartTime
-                    EndTime        = $EndTime
-                    ServiceFilters = @($MatchingConfigs | Select-Object -Property type | Sort-Object -Property type -Unique | ForEach-Object { $_.type.split('.')[1] })
-                }
+            [PSCustomObject]@{
+                FunctionName = 'AuditLogSearchCreation'
+                Tenant       = $Tenant | Select-Object defaultDomainName, customerId, displayName
+                StartTime    = $StartTime
+                EndTime      = $EndTime
             }
         }
 

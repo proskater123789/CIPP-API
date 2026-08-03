@@ -4,6 +4,8 @@ Function Invoke-ListAllTenantDeviceCompliance {
         Entrypoint
     .ROLE
         Tenant.DeviceCompliance.Read
+    .DESCRIPTION
+        Lists device compliance summary across all managed tenants using the Lighthouse managedDeviceCompliances API, or for a single tenant via Intune.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -11,7 +13,9 @@ Function Invoke-ListAllTenantDeviceCompliance {
     $TenantFilter = $Request.Query.TenantFilter
     try {
         if ($TenantFilter -eq 'AllTenants') {
-            $GraphRequest = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/tenantRelationships/managedTenants/managedDeviceCompliances'
+            # The Lighthouse aggregate returns every managed tenant with no per-caller scoping, so
+            # narrow it to the tenants this caller is allowed to see (organizationId = customerId).
+            $GraphRequest = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/tenantRelationships/managedTenants/managedDeviceCompliances' | Select-CippAllowedTenantData -TenantProperty 'organizationId'
             $StatusCode = [HttpStatusCode]::OK
         } else {
             $GraphRequest = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/tenantRelationships/managedTenants/managedDeviceCompliances?`$top=999&`$filter=organizationId eq '$TenantFilter'"
